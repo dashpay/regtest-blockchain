@@ -7,6 +7,7 @@ Provides detailed error types for better error handling and user feedback.
 
 class GeneratorError(Exception):
     """Base exception for all generator errors"""
+
     pass
 
 
@@ -24,26 +25,19 @@ class InsufficientFundsError(GeneratorError):
 
     This should never happen with proper UTXO management.
     """
+
     pass
 
 
 class ConfigError(GeneratorError):
     """Invalid configuration"""
-    pass
 
-
-class ValidationError(GeneratorError):
-    """Data validation failures"""
-    pass
-
-
-class ExportError(GeneratorError):
-    """Export operation failures"""
     pass
 
 
 class DashdConnectionError(RPCError):
     """Cannot connect to dashd"""
+
     pass
 
 

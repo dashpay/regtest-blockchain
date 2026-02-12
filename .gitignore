@@ -4,6 +4,11 @@
 # IDE
 .idea/
 
+# Python
+__pycache__/
+.venv/
+.pytest_cache/
+
 # Data (distributed via releases)
 data/
 
