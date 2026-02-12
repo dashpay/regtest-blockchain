@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  DASHVERSION: "23.0.2"
+
+jobs:
+  pre-commit:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          allow-prereleases: true
+
+      - name: Cache dashd
+        uses: actions/cache@v4
+        with:
+          path: .dashd-cache
+          key: dashd-${{ runner.os }}-${{ env.DASHVERSION }}
+
+      - name: Setup dashd
+        env:
+          CACHE_DIR: ${{ github.workspace }}/.dashd-cache
+        run: python contrib/setup-dashd.py >> "$GITHUB_ENV"
+
+      - uses: pre-commit/action@v3.0.1
