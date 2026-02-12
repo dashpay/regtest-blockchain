@@ -2,11 +2,12 @@
 Efficient RPC client with retry logic and error handling.
 """
 
-import subprocess
 import json
+import subprocess
 import time
-from typing import Any, List, Optional
-from .errors import RPCError, DashdConnectionError, InsufficientFundsError
+from typing import Any
+
+from .errors import DashdConnectionError, InsufficientFundsError, RPCError
 
 
 class DashRPCClient:
@@ -19,11 +20,11 @@ class DashRPCClient:
     def __init__(
         self,
         dashcli_path: str = "dash-cli",
-        datadir: Optional[str] = None,
+        datadir: str | None = None,
         network: str = "regtest",
-        rpc_timeout: int = 30,
+        rpc_timeout: int = 120,
         max_retries: int = 3,
-        rpc_port: Optional[int] = None
+        rpc_port: int | None = None,
     ):
         self.dashcli = dashcli_path
         self.datadir = datadir
@@ -32,7 +33,7 @@ class DashRPCClient:
         self.max_retries = max_retries
         self.rpc_port = rpc_port
 
-    def call(self, method: str, *params, wallet: Optional[str] = None) -> Any:
+    def call(self, method: str, *params, wallet: str | None = None) -> Any:
         """
         Call RPC method with retry logic and comprehensive error handling.
         """
@@ -41,21 +42,14 @@ class DashRPCClient:
                 return self._execute(method, params, wallet)
             except subprocess.TimeoutExpired:
                 if attempt == self.max_retries - 1:
-                    raise RPCError(
-                        f"RPC timeout after {self.rpc_timeout}s: {method}",
-                        code=-1
-                    )
-                time.sleep(2 ** attempt)
-            except ConnectionRefusedError as e:
+                    raise RPCError(f"RPC timeout after {self.rpc_timeout}s: {method}", code=-1) from None
+                time.sleep(2**attempt)
+            except DashdConnectionError:
                 if attempt == self.max_retries - 1:
-                    raise DashdConnectionError(
-                        f"Cannot connect to dashd: {e}"
-                    )
-                time.sleep(2 ** attempt)
+                    raise
+                time.sleep(2**attempt)
 
-        raise RPCError(f"Failed after {self.max_retries} retries: {method}")
-
-    def _execute(self, method: str, params: tuple, wallet: Optional[str]) -> Any:
+    def _execute(self, method: str, params: tuple, wallet: str | None) -> Any:
         """Execute single RPC call"""
         cmd = [self.dashcli, f"-{self.network}"]
 
@@ -71,16 +65,13 @@ class DashRPCClient:
         cmd.append(method)
         for p in params:
             if isinstance(p, bool):
-                cmd.append('true' if p else 'false')
+                cmd.append("true" if p else "false")
+            elif isinstance(p, (dict, list)):
+                cmd.append(json.dumps(p))
             else:
                 cmd.append(str(p))
 
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=self.rpc_timeout
-        )
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=self.rpc_timeout)
 
         if result.returncode != 0:
             self._handle_error(method, result.stderr)
@@ -99,8 +90,7 @@ class DashRPCClient:
 
         if "error code: -6" in stderr_lower or "insufficient funds" in stderr_lower:
             raise InsufficientFundsError(
-                f"UTXO pool depleted during {method}. "
-                "This indicates a bug in UTXO management."
+                f"UTXO pool depleted during {method}. This indicates a bug in UTXO management."
             )
 
         if "error code: -28" in stderr_lower:
