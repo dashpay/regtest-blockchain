@@ -37,7 +37,6 @@ DASHD_EXTRA_ARGS = [
     "-dip3params=2:2",
     "-testactivationheight=v20@100",
     "-testactivationheight=mn_rr@100",
-    "-llmqtestinstantsenddip0024=llmq_test_instantsend",
 ]
 
 

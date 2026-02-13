@@ -100,8 +100,18 @@ class MasternodeNode:
         return False
 
     def stop(self):
-        """Stop the dashd process."""
+        """Stop the dashd process gracefully via RPC, falling back to SIGTERM."""
         if self.process:
+            # Try RPC stop first for clean shutdown (flushes evoDB, quorum snapshots)
+            if self.rpc:
+                try:
+                    self.rpc.call("stop")
+                    self.process.wait(timeout=30)
+                    self.process = None
+                    return
+                except Exception:
+                    pass
+            # Fallback to SIGTERM
             try:
                 self.process.terminate()
                 self.process.wait(timeout=15)
