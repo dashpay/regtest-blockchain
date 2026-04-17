@@ -32,6 +32,8 @@ DKG_INTERVAL = 24
 NUM_MASTERNODES = 4
 LLMQ_TEST_SIZE = 3  # llmq_test (type 100) - 3 members out of 4 MNs
 LLMQ_TEST_DIP0024_SIZE = 4  # llmq_test_dip0024 (type 103) - all 4 MNs, minSize=4
+DKG_MINING_WINDOW_END = 20  # matches llmq_test / llmq_test_dip0024 dkgMiningWindowEnd
+SIGN_HEIGHT_OFFSET = 8  # maturity blocks after commit so quorum is signing-eligible
 SPORK_PRIVATE_KEY = "cP4EKFyJsHT39LDqgdcB43Y3YXjNyjb5Fuas1GQSeAtjnZWmZEQK"
 
 DASHD_EXTRA_ARGS = [
@@ -537,9 +539,8 @@ def _run_single_dkg_cycle(network, cycle_idx, num_cycles, cycle_quorum_is_ready)
     wait_for_quorum_list(network, "llmq_test", [q_0])
     wait_for_quorum_list(network, "llmq_test_dip0024", [q_0, q_1])
 
-    # Mine 8 blocks (SIGN_HEIGHT_OFFSET) for signing-window maturity, matching
-    # the tail of test_framework.mine_cycle_quorum.
-    network.move_blocks(8)
+    # SIGN_HEIGHT_OFFSET maturity blocks, matching test_framework.mine_cycle_quorum.
+    network.move_blocks(SIGN_HEIGHT_OFFSET)
 
     qlist = rpc.call("quorum", "list")
     print(
@@ -592,6 +593,66 @@ def phase_6_generate_test_transactions(network):
 
     height = rpc.call("getblockcount")
     print(f"  Generated {len(amounts)} test transactions (height: {height})")
+
+
+def phase_6b_extend_to_quiet_tip(network):
+    """Stop masternodes and extend the chain past the next DKG mining window.
+
+    After phase 5 (orchestrated DKG cycles) and phase 6 (test transactions),
+    the tip typically sits inside a DKG cycle whose phase 1 already started
+    but whose mining window has not opened yet (e.g. block 412, inside cycle
+    408's phase 3 for the default 8-cycle run). Exporting at that tip is
+    pathological for test harnesses that bring the MNs back online later:
+    the MNs miss the early phases of the in-progress cycle and cannot
+    contribute, so when the test mines further blocks the cycle's mining
+    window fills with null commitments. Those null commits then leave a
+    future QRInfo range without ChainLock sigs for the rotation, tripping
+    the rust-dashcore QRInfo pre-check ("Missing rotation ChainLock
+    signatures in QRInfo").
+
+    The fix: stop the masternodes and mine controller-only blocks past the
+    next cycle's mining window + maturity. With no MN to broadcast qfcommit,
+    the controller's `minableCommitmentsByQuorum` is empty at the window, so
+    null commitments are mined deterministically and the cycle is SETTLED in
+    the chain. When the test harness later restarts MNs at the exported tip
+    and drives `mine_dkg_cycle`, it aligns to the next boundary and runs a
+    fresh DKG from phase 1 — no partial cycle to race against.
+
+    Target tip formula matches the convention in the task brief:
+    `cycle_start_of_current_cycle + DKG_INTERVAL + dkgMiningWindowEnd +
+    SIGN_HEIGHT_OFFSET`. For the default run (current tip ~412, current
+    cycle start 408) this lands at 460.
+    """
+    print("\n" + "=" * 60)
+    print("Phase 6b: Extend chain to quiet tip")
+    print("=" * 60)
+
+    rpc = network.controller.rpc
+    current = rpc.call("getblockcount")
+    current_cycle_start = current - (current % DKG_INTERVAL)
+    target = current_cycle_start + DKG_INTERVAL + DKG_MINING_WINDOW_END + SIGN_HEIGHT_OFFSET
+    if current >= target:
+        print(f"  Already at tip {current}, no extension needed")
+        return
+
+    print("  Stopping masternodes (controller-only mining from here)...")
+    for mn in network.masternodes:
+        mn.stop()
+    time.sleep(2)
+
+    # Mine on the controller in batches, advancing mocktime in step so block
+    # timestamps stay strictly increasing. Matches the cache-setup pattern
+    # in phase_1_bootstrap.
+    remaining = target - current
+    print(f"  Mining {remaining} blocks on controller (tip {current} -> {target})...")
+    while remaining > 0:
+        batch = min(remaining, 25)
+        network.bump_mocktime(batch * 156)
+        rpc.call("generatetoaddress", batch, network.fund_address)
+        remaining -= batch
+
+    final_tip = rpc.call("getblockcount")
+    print(f"  Final tip: {final_tip}")
 
 
 def phase_7_export(network, output_base_dir, dkg_cycles):
@@ -695,6 +756,7 @@ def main():
         phase_4_enable_sporks(network)
         phase_5_mine_dkg_cycles(network, args.dkg_cycles)
         phase_6_generate_test_transactions(network)
+        phase_6b_extend_to_quiet_tip(network)
         output_dir = phase_7_export(network, args.output_dir, args.dkg_cycles)
 
         print("\n" + "=" * 60)
