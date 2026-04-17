@@ -11,7 +11,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from .dashd_manager import DashdManager, dashd_preexec_fn
+from .dashd_manager import dashd_preexec_fn
 from .rpc_client import DashRPCClient
 
 
@@ -207,7 +207,7 @@ class MasternodeNetwork:
 
         # Restart controller (with current mocktime if available)
         restart_args = list(controller_extra)
-        if hasattr(self, '_mocktime') and self._mocktime:
+        if hasattr(self, "_mocktime") and self._mocktime:
             # Remove any old mocktime arg and add current one
             restart_args = [a for a in restart_args if not a.startswith("-mocktime=")]
             restart_args.append(f"-mocktime={self._mocktime}")
@@ -244,14 +244,16 @@ class MasternodeNetwork:
             rpc_port = find_free_port(p2p_port + 1)
 
             mn_args = list(self.base_extra_args)
-            mn_args.extend([
-                "-blockfilterindex=1",
-                "-peerblockfilters=1",
-                "-txindex=1",
-                f"-masternodeblsprivkey={mn_info['bls_private_key']}",
-            ])
+            mn_args.extend(
+                [
+                    "-blockfilterindex=1",
+                    "-peerblockfilters=1",
+                    "-txindex=1",
+                    f"-masternodeblsprivkey={mn_info['bls_private_key']}",
+                ]
+            )
             # Pass mocktime at startup so DKG scheduling works
-            if hasattr(self, '_mocktime') and self._mocktime:
+            if hasattr(self, "_mocktime") and self._mocktime:
                 mn_args.append(f"-mocktime={self._mocktime}")
 
             node = MasternodeNode(
@@ -295,6 +297,18 @@ class MasternodeNetwork:
             except Exception as e:
                 print(f"    Warning: addnode controller->{mn.name} failed: {e}")
 
+        # Direct MN<->MN connections so DKG message exchange does not have to
+        # wait for the quorum manager to build them lazily. Without these,
+        # DIP-0024 DKGs (4 members, minSize=4) can advance past phase 2 before
+        # contributions have propagated, producing null commitments.
+        for i, mn_a in enumerate(self.masternodes):
+            for mn_b in self.masternodes[i + 1 :]:
+                target = f"127.0.0.1:{mn_b.p2p_port}"
+                try:
+                    mn_a.rpc.call("addnode", target, "onetry")
+                except Exception as e:
+                    print(f"    Warning: addnode {mn_a.name}->{mn_b.name} failed: {e}")
+
         # Re-enable MN threads
         for mn in self.masternodes:
             try:
@@ -304,7 +318,7 @@ class MasternodeNetwork:
 
         # Wait for connections to establish
         peer_count = 0
-        for attempt in range(15):
+        for _ in range(15):
             time.sleep(2)
             peer_count = len(self.controller.rpc.call("getpeerinfo"))
             if peer_count >= len(self.masternodes):
