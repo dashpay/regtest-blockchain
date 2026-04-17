@@ -7,6 +7,7 @@ Handles node lifecycle, peer connections, and DKG cycle mining.
 
 import shutil
 import socket
+import subprocess
 import tempfile
 import time
 from pathlib import Path
@@ -30,8 +31,6 @@ class MasternodeNode:
 
     def start(self):
         """Start the dashd process."""
-        import subprocess
-
         regtest_dir = self.datadir / "regtest"
         regtest_dir.mkdir(parents=True, exist_ok=True)
 
@@ -123,6 +122,37 @@ class MasternodeNode:
                     pass
             self.process = None
 
+    def force_finish_mnsync(self, attempts=20, poll=0.5):
+        """Force mnsync completion.
+
+        Masternodes reject connections until they have finished mnsync, so
+        this must be driven explicitly after start-up before peer connections
+        are issued.
+        """
+        for _ in range(attempts):
+            try:
+                status = self.rpc.call("mnsync", "status")
+                if status.get("IsSynced", False):
+                    return
+                self.rpc.call("mnsync", "next")
+                time.sleep(poll)
+            except Exception:
+                time.sleep(poll)
+
+    def set_mocktime(self, mocktime, seconds=None):
+        """Set mocktime on this node and optionally tick the scheduler.
+
+        When `seconds` is given, also runs `mockscheduler` so scheduled tasks
+        (DKG session processing, etc.) fire at the advanced time.
+        """
+        try:
+            self.rpc.call("setmocktime", mocktime)
+            if seconds is not None:
+                self.rpc.call("mockscheduler", seconds)
+        except Exception:
+            # Nodes may be briefly unresponsive during DKG work; tolerate.
+            pass
+
 
 def find_free_port(start=19000, attempts=100):
     """Find an available TCP port."""
@@ -153,6 +183,31 @@ class MasternodeNetwork:
         self.masternode_info = []  # BLS keys, addresses, proTxHashes
         self.mn_p2p_ports = []  # Pre-allocated P2P ports for MN registration
         self.fund_address = None  # Address holding mining rewards (set in bootstrap)
+        self.mocktime = 0  # Shared mock time, advanced via set/bump_mocktime
+
+    def all_nodes(self):
+        """Return [controller, *masternodes], skipping any that are not started."""
+        return [n for n in ([self.controller] + self.masternodes) if n is not None]
+
+    def set_mocktime(self, mocktime):
+        """Set mocktime on all running nodes and update the tracked value."""
+        self.mocktime = mocktime
+        for node in self.all_nodes():
+            node.set_mocktime(mocktime)
+
+    def bump_mocktime(self, seconds=1):
+        """Advance mocktime by `seconds` on all running nodes and tick the scheduler."""
+        self.mocktime += seconds
+        for node in self.all_nodes():
+            node.set_mocktime(self.mocktime, seconds=seconds)
+
+    def move_blocks(self, count):
+        """Bump mocktime, mine `count` blocks on the controller, then sync masternodes."""
+        if count <= 0:
+            return
+        self.bump_mocktime(1)
+        self.generate_blocks(count)
+        self.wait_for_sync()
 
     def allocate_mn_ports(self):
         """Pre-allocate P2P ports for masternodes (needed for protx registration)."""
@@ -187,7 +242,7 @@ class MasternodeNetwork:
         self.controller.start()
         return self.controller
 
-    def start_masternode_nodes(self, controller_datadir):
+    def start_masternode_nodes(self):
         """Start masternode nodes from a copy of the controller's datadir.
 
         Each node gets a unique BLS private key. Connection and mnsync
@@ -195,6 +250,7 @@ class MasternodeNetwork:
         Must be called after masternodes have been registered on the controller.
         """
         print("\n  Starting masternode nodes...")
+        assert self.mn_p2p_ports, "allocate_mn_ports() must be called before start_masternode_nodes()"
 
         # Stop controller briefly to copy its datadir
         controller_rpc_port = self.controller.rpc_port
@@ -205,12 +261,9 @@ class MasternodeNetwork:
         self.controller.stop()
         time.sleep(2)
 
-        # Restart controller (with current mocktime if available)
-        restart_args = list(controller_extra)
-        if hasattr(self, "_mocktime") and self._mocktime:
-            # Remove any old mocktime arg and add current one
-            restart_args = [a for a in restart_args if not a.startswith("-mocktime=")]
-            restart_args.append(f"-mocktime={self._mocktime}")
+        # Restart controller with current mocktime baked into the command line.
+        restart_args = [a for a in controller_extra if not a.startswith("-mocktime=")]
+        restart_args.append(f"-mocktime={self.mocktime}")
         self.controller = MasternodeNode(
             name="controller",
             dashd_path=self.dashd_path,
@@ -236,11 +289,7 @@ class MasternodeNetwork:
                 if stale_path.exists():
                     stale_path.unlink()
 
-            # Use pre-allocated P2P port if available, otherwise find a free one
-            if i < len(self.mn_p2p_ports):
-                p2p_port = self.mn_p2p_ports[i]
-            else:
-                p2p_port = find_free_port(controller_p2p_port + 10 + i * 10)
+            p2p_port = self.mn_p2p_ports[i]
             rpc_port = find_free_port(p2p_port + 1)
 
             mn_args = list(self.base_extra_args)
@@ -250,11 +299,9 @@ class MasternodeNetwork:
                     "-peerblockfilters=1",
                     "-txindex=1",
                     f"-masternodeblsprivkey={mn_info['bls_private_key']}",
+                    f"-mocktime={self.mocktime}",
                 ]
             )
-            # Pass mocktime at startup so DKG scheduling works
-            if hasattr(self, "_mocktime") and self._mocktime:
-                mn_args.append(f"-mocktime={self._mocktime}")
 
             node = MasternodeNode(
                 name=mn_name,
@@ -268,12 +315,20 @@ class MasternodeNetwork:
             self.masternodes.append(node)
 
     def connect_all(self):
-        """Connect all nodes to each other following Dash Core's test framework.
+        """Establish the full controller↔MN and MN↔MN peer mesh.
 
-        Disables masternode threads during connection to prevent interference
-        with the P2P handshake (matching DashTestFramework.connect_nodes).
-        Uses "onetry" mode as the Dash Core test framework does.
+        Following Dash Core's test framework, masternode threads are disabled
+        during connection to prevent interference with the P2P handshake, and
+        the direct MN↔MN links ensure DKG contributions propagate without
+        waiting for the quorum manager to build them lazily.
         """
+
+        def try_addnode(from_node, target_addr, label):
+            try:
+                from_node.rpc.call("addnode", target_addr, "onetry")
+            except Exception as e:
+                print(f"    Warning: addnode {label} failed: {e}")
+
         # Disable MN threads during connection (prevents handshake interference)
         for mn in self.masternodes:
             try:
@@ -281,33 +336,16 @@ class MasternodeNetwork:
             except Exception:
                 pass
 
-        # Connect each MN to the controller
+        controller_addr = f"127.0.0.1:{self.controller.p2p_port}"
         for mn in self.masternodes:
-            controller_addr = f"127.0.0.1:{self.controller.p2p_port}"
-            try:
-                mn.rpc.call("addnode", controller_addr, "onetry")
-            except Exception as e:
-                print(f"    Warning: addnode {mn.name}->controller failed: {e}")
+            try_addnode(mn, controller_addr, f"{mn.name}->controller")
+            try_addnode(self.controller, f"127.0.0.1:{mn.p2p_port}", f"controller->{mn.name}")
 
-        # Also connect controller to each MN
-        for mn in self.masternodes:
-            mn_addr = f"127.0.0.1:{mn.p2p_port}"
-            try:
-                self.controller.rpc.call("addnode", mn_addr, "onetry")
-            except Exception as e:
-                print(f"    Warning: addnode controller->{mn.name} failed: {e}")
-
-        # Direct MN<->MN connections so DKG message exchange does not have to
-        # wait for the quorum manager to build them lazily. Without these,
-        # DIP-0024 DKGs (4 members, minSize=4) can advance past phase 2 before
-        # contributions have propagated, producing null commitments.
+        # Direct MN<->MN links: DIP-0024 quorums (minSize=4) need contributions
+        # from every member, so seeding the mesh avoids phase-2 starvation.
         for i, mn_a in enumerate(self.masternodes):
             for mn_b in self.masternodes[i + 1 :]:
-                target = f"127.0.0.1:{mn_b.p2p_port}"
-                try:
-                    mn_a.rpc.call("addnode", target, "onetry")
-                except Exception as e:
-                    print(f"    Warning: addnode {mn_a.name}->{mn_b.name} failed: {e}")
+                try_addnode(mn_a, f"127.0.0.1:{mn_b.p2p_port}", f"{mn_a.name}->{mn_b.name}")
 
         # Re-enable MN threads
         for mn in self.masternodes:
