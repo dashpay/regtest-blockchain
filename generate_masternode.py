@@ -576,7 +576,34 @@ def phase_5_mine_dkg_cycles(network, num_cycles):
 
 
 def phase_6_generate_test_transactions(network):
-    """Send transactions to the SPV test wallet."""
+    """Send transactions to the SPV test wallet and land tip in the DKG Idle gap.
+
+    At entry the tip is `cycle_N + 20` (just past the last orchestrated
+    cycle's mining window, with masternodes still running). We send the SPV
+    test transactions into the mempool and then mine exactly enough blocks
+    to confirm them AND to land the final tip at `cycle_N + 23`, which is
+    the last Idle-phase block before the next cycle's phase 1 at
+    `cycle_{N+1} + 0`.
+
+    Why this range: a tip at `cycle_N + X` for X in [21, 23] sits in the
+    DKG Idle window (the state machine moves to Idle at `cycle_N + 12` and
+    stays there until the next cycle's phase 1). Crucially:
+
+    - No DKG phase is mid-flight at the exported tip, so when a test harness
+      restarts the masternodes they do not inherit a partially-lived DKG
+      (which would null-commit under them when later blocks reached the
+      mining window).
+    - The most recent rotating commit is already in evoDB (mined at
+      `cycle_N + 12`), so a subsequent QRInfo whose work block is `tip - 8`
+      can reach it — at tip 407 the work block is 399, well past the
+      commit at 396 for cycle_start=384.
+    - The tip is still BEFORE the next cycle's phase 1 at `cycle_N + 24`,
+      so `mine_dkg_cycle` invoked from the test harness aligns to that
+      boundary and drives the next DKG from phase 1 with MNs online.
+
+    Masternodes stay running throughout so every rotating commitment in
+    the chain is real (non-zero `signers`, non-zero `quorumPublicKey`).
+    """
     print("\n" + "=" * 60)
     print("Phase 6: Generate SPV test transactions")
     print("=" * 60)
@@ -586,73 +613,26 @@ def phase_6_generate_test_transactions(network):
     amounts = [1.0, 5.0, 10.0, 0.5, 25.0, 0.1, 50.0, 2.5]
     for i, amount in enumerate(amounts):
         rpc.call("sendtoaddress", addresses[i % len(addresses)], amount)
-        if (i + 1) % 3 == 0:
-            network.move_blocks(1)
 
-    network.move_blocks(6)
-
+    # Mine enough blocks to confirm all transactions and place the tip at
+    # `cycle_N + (DKG_INTERVAL - 1)` — the last Idle-phase block before the
+    # next cycle's phase 1. Phase 5 leaves tip at `cycle_N + DKG_MINING_WINDOW_END`,
+    # so we need `DKG_INTERVAL - 1 - DKG_MINING_WINDOW_END` additional blocks.
     height = rpc.call("getblockcount")
-    print(f"  Generated {len(amounts)} test transactions (height: {height})")
+    cycle_offset = height % DKG_INTERVAL
+    assert cycle_offset == DKG_MINING_WINDOW_END, (
+        f"Expected phase 5 to leave tip at cycle_offset={DKG_MINING_WINDOW_END}, got {cycle_offset} (tip {height})"
+    )
+    blocks_to_mine = DKG_INTERVAL - 1 - DKG_MINING_WINDOW_END
+    network.move_blocks(blocks_to_mine)
 
-
-def phase_6b_extend_to_quiet_tip(network):
-    """Stop masternodes and extend the chain past the next DKG mining window.
-
-    After phase 5 (orchestrated DKG cycles) and phase 6 (test transactions),
-    the tip typically sits inside a DKG cycle whose phase 1 already started
-    but whose mining window has not opened yet (e.g. block 412, inside cycle
-    408's phase 3 for the default 8-cycle run). Exporting at that tip is
-    pathological for test harnesses that bring the MNs back online later:
-    the MNs miss the early phases of the in-progress cycle and cannot
-    contribute, so when the test mines further blocks the cycle's mining
-    window fills with null commitments. Those null commits then leave a
-    future QRInfo range without ChainLock sigs for the rotation, tripping
-    the rust-dashcore QRInfo pre-check ("Missing rotation ChainLock
-    signatures in QRInfo").
-
-    The fix: stop the masternodes and mine controller-only blocks past the
-    next cycle's mining window + maturity. With no MN to broadcast qfcommit,
-    the controller's `minableCommitmentsByQuorum` is empty at the window, so
-    null commitments are mined deterministically and the cycle is SETTLED in
-    the chain. When the test harness later restarts MNs at the exported tip
-    and drives `mine_dkg_cycle`, it aligns to the next boundary and runs a
-    fresh DKG from phase 1 — no partial cycle to race against.
-
-    Target tip formula matches the convention in the task brief:
-    `cycle_start_of_current_cycle + DKG_INTERVAL + dkgMiningWindowEnd +
-    SIGN_HEIGHT_OFFSET`. For the default run (current tip ~412, current
-    cycle start 408) this lands at 460.
-    """
-    print("\n" + "=" * 60)
-    print("Phase 6b: Extend chain to quiet tip")
-    print("=" * 60)
-
-    rpc = network.controller.rpc
-    current = rpc.call("getblockcount")
-    current_cycle_start = current - (current % DKG_INTERVAL)
-    target = current_cycle_start + DKG_INTERVAL + DKG_MINING_WINDOW_END + SIGN_HEIGHT_OFFSET
-    if current >= target:
-        print(f"  Already at tip {current}, no extension needed")
-        return
-
-    print("  Stopping masternodes (controller-only mining from here)...")
-    for mn in network.masternodes:
-        mn.stop()
-    time.sleep(2)
-
-    # Mine on the controller in batches, advancing mocktime in step so block
-    # timestamps stay strictly increasing. Matches the cache-setup pattern
-    # in phase_1_bootstrap.
-    remaining = target - current
-    print(f"  Mining {remaining} blocks on controller (tip {current} -> {target})...")
-    while remaining > 0:
-        batch = min(remaining, 25)
-        network.bump_mocktime(batch * 156)
-        rpc.call("generatetoaddress", batch, network.fund_address)
-        remaining -= batch
-
-    final_tip = rpc.call("getblockcount")
-    print(f"  Final tip: {final_tip}")
+    final_height = rpc.call("getblockcount")
+    final_offset = final_height % DKG_INTERVAL
+    assert DKG_MINING_WINDOW_END < final_offset < DKG_INTERVAL, (
+        f"Final tip {final_height} at cycle_offset={final_offset} is not in the "
+        f"DKG Idle gap ({DKG_MINING_WINDOW_END + 1}..{DKG_INTERVAL - 1})"
+    )
+    print(f"  Generated {len(amounts)} test transactions (tip: {final_height}, cycle_offset: {final_offset})")
 
 
 def phase_7_export(network, output_base_dir, dkg_cycles):
@@ -756,7 +736,6 @@ def main():
         phase_4_enable_sporks(network)
         phase_5_mine_dkg_cycles(network, args.dkg_cycles)
         phase_6_generate_test_transactions(network)
-        phase_6b_extend_to_quiet_tip(network)
         output_dir = phase_7_export(network, args.output_dir, args.dkg_cycles)
 
         print("\n" + "=" * 60)
