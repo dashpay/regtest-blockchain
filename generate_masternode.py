@@ -614,16 +614,22 @@ def phase_6_generate_test_transactions(network):
     for i, amount in enumerate(amounts):
         rpc.call("sendtoaddress", addresses[i % len(addresses)], amount)
 
-    # Mine enough blocks to confirm all transactions and place the tip at
-    # `cycle_N + (DKG_INTERVAL - 1)` — the last Idle-phase block before the
-    # next cycle's phase 1. Phase 5 leaves tip at `cycle_N + DKG_MINING_WINDOW_END`,
-    # so we need `DKG_INTERVAL - 1 - DKG_MINING_WINDOW_END` additional blocks.
+    # Mine enough blocks to confirm all transactions and land the tip at the
+    # CENTER of the DKG Idle gap at `cycle_N + (DKG_INTERVAL - 2)` (= 22 for
+    # default params). The gap is the 3-block window `[cycle_N + 21,
+    # cycle_N + 23]`: past the last cycle's mining window and before the next
+    # cycle's phase 1 at `cycle_N + 24`. Centering the tip leaves one block
+    # of margin on each side so test harnesses that mine a block before
+    # checking don't accidentally cross `cycle_N + 24` and start a DKG the
+    # masternodes just-brought-online can't participate in.
+    # Phase 5 leaves tip at `cycle_N + DKG_MINING_WINDOW_END`, so we need
+    # `DKG_INTERVAL - 2 - DKG_MINING_WINDOW_END` additional blocks.
     height = rpc.call("getblockcount")
     cycle_offset = height % DKG_INTERVAL
     assert cycle_offset == DKG_MINING_WINDOW_END, (
         f"Expected phase 5 to leave tip at cycle_offset={DKG_MINING_WINDOW_END}, got {cycle_offset} (tip {height})"
     )
-    blocks_to_mine = DKG_INTERVAL - 1 - DKG_MINING_WINDOW_END
+    blocks_to_mine = DKG_INTERVAL - 2 - DKG_MINING_WINDOW_END
     network.move_blocks(blocks_to_mine)
 
     final_height = rpc.call("getblockcount")
