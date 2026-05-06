@@ -65,21 +65,69 @@ python3 export_wallets.py data/regtest-15000
 
 This starts a temporary dashd instance, loads all wallets found in the data directory, and writes updated JSON files to `wallets/`.
 
+## Masternode Network
+
+A separate generator produces a regtest chain with a fully-active 4-masternode network and real DIP-0024 rotating quorums, intended for SPV masternode-list-sync integration tests:
+
+```bash
+curl -LO https://github.com/dashpay/regtest-blockchain/releases/latest/download/regtest-mn.tar.gz
+tar -xzf regtest-mn.tar.gz
+```
+
+The exported directory contains 5 dashd datadirs (1 controller + 4 masternodes), the `network.json` metadata file, and exported wallet stats:
+
+```
+regtest-mn/
+├── network.json          # MN keys, proTxHashes, chain_height, dkg_cycles_completed, dashd args
+├── controller/regtest/   # controller datadir (full chain + wallet)
+├── mn1/regtest/          # masternode 1 datadir
+├── mn2/regtest/
+├── mn3/regtest/
+├── mn4/regtest/
+└── wallets/wallet.json   # exported wallet stats (mnemonics, addresses, txs)
+```
+
+Consumers (e.g. `rust-dashcore/dash-spv` integration tests) point at the directory via env var:
+
+```bash
+DASHD_PATH=/path/to/dashd \
+DASHD_MN_DATADIR=/path/to/regtest-mn \
+cargo test -p dash-spv --test dashd_masternode
+```
+
+The chain ships with 8 successfully-mined DKG cycles for both `llmq_test` (type 100, 3 members) and `llmq_test_dip0024` (type 103, 4 members, rotating). Every commit is real (non-zero `quorumPublicKey`); the exit tip lands in the DKG Idle gap so consumers can drive a fresh `mine_dkg_cycle` from phase 1 cleanly.
+
+Generate locally:
+
+```bash
+python3 generate_masternode.py --dashd-path /path/to/dashd
+
+# Custom number of DKG cycles (default: 8)
+python3 generate_masternode.py --dashd-path /path/to/dashd --dkg-cycles 12
+
+# Custom output directory
+python3 generate_masternode.py --dashd-path /path/to/dashd --output-dir /tmp/output
+```
+
+End-to-end generation takes a few minutes — masternodes run as separate dashd processes and walk through DKG phases 1-6 with message-count gating that mirrors Dash Core's `mine_quorum` / `mine_cycle_quorum` test helpers.
+
 ## Project Structure
 
 ```
-├── generate.py           # main generation script
-├── export_wallets.py     # re-export wallet data from existing blockchain
+├── generate.py                  # block-mining + wallet generation script
+├── generate_masternode.py       # masternode-network + DKG cycle generation script
+├── export_wallets.py            # re-export wallet data from existing blockchain
 ├── contrib/
-│   └── setup-dashd.py    # cross-platform dashd binary download for CI
-├── generator/            # generation library
-│   ├── dashd_manager.py  # dashd process lifecycle management
-│   ├── rpc_client.py     # dash-cli RPC wrapper
-│   ├── wallet_export.py  # wallet statistics collection and JSON export
-│   └── errors.py         # error types
-├── tests/                # unit and integration tests
-├── data/                 # generated datasets (git-tracked)
-└── .github/workflows/    # CI configuration
+│   └── setup-dashd.py           # cross-platform dashd binary download for CI
+├── generator/                   # generation library
+│   ├── dashd_manager.py         # dashd process lifecycle management
+│   ├── masternode_network.py    # multi-node masternode network manager
+│   ├── rpc_client.py            # dash-cli RPC wrapper
+│   ├── wallet_export.py         # wallet statistics collection and JSON export
+│   └── errors.py                # error types
+├── tests/                       # unit and integration tests
+├── data/                        # generated datasets (git-tracked)
+└── .github/workflows/           # CI configuration
 ```
 
 ## Development
