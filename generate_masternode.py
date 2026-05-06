@@ -650,7 +650,7 @@ def phase_7_export(network, output_base_dir, dkg_cycles):
     rpc = network.controller.rpc
     chain_height = rpc.call("getblockcount")
 
-    output_dir = Path(output_base_dir) / "regtest-mn-v0.0.1"
+    output_dir = Path(output_base_dir) / "regtest-mn"
     if output_dir.exists():
         print(f"  Removing existing output: {output_dir}")
         shutil.rmtree(output_dir)
